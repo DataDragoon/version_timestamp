@@ -457,6 +457,7 @@ class SFCWEngine:
     def _start_tx_rx(self):
         self._rx_cond = threading.Condition()
         self._rx_latest = None
+        self._rx_latest_ts = None
         self._rx_seq = 0
         n = 4096
         t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
@@ -470,6 +471,12 @@ class SFCWEngine:
             print(f"[bladerf] RX timestamp: {ts} (FPGA counter {'active' if ts else 'NOT running - custom RBF not loaded?'})")
         except Exception as e:
             print(f"[bladerf] WARNING: timestamp read failed: {e}")
+
+        # In-band decode summary (driver fills these from meta.timestamp)
+        if self.driver.rx_first_timestamp is not None:
+            print(f"[sfcw] in-band timestamps: first={self.driver.rx_first_timestamp} "
+                  f"latest={self.driver.last_rx_timestamp} "
+                  f"buffers={self.driver.rx_buffer_count}", flush=True)
 
         # enable_module() resets gain state, so re-push after modules are enabled.
         # driver.tx_gain/rx_gain/tx2_gain/rx2_gain were already synced from
@@ -495,6 +502,9 @@ class SFCWEngine:
     def _rx_capture(self, rx1_iq, rx2_iq):
         with self._rx_cond:
             self._rx_latest = (rx1_iq, rx2_iq)
+            # FPGA timestamp of this buffer, decoded by the driver's RX loop
+            # just before this callback (None in plain SFCW_META=0 mode).
+            self._rx_latest_ts = self.driver.last_rx_timestamp
             self._rx_seq += 1
             self._rx_cond.notify_all()
 
@@ -578,11 +588,16 @@ class SFCWEngine:
                 libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
                 libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
 
+            step_first_ts = None
+            step_last_ts = None
+
             with rx_cond:
                 target_seq = self._rx_seq + settle_count
                 while self._rx_seq < target_seq:
                     if not rx_cond.wait(timeout=1.0):
                         break
+                    if step_first_ts is None:
+                        step_first_ts = self._rx_latest_ts
 
                 sig_bufs = []
                 ref_bufs = []
@@ -596,6 +611,19 @@ class SFCWEngine:
                     last_seq = self._rx_seq
                     sig_bufs.append(self._rx_latest[0])
                     ref_bufs.append(self._rx_latest[1])
+                    step_last_ts = self._rx_latest_ts
+
+            # Per-step timestamp span: (settle_count + num_buffers) consecutive
+            # buffers should cover exactly that many buffer-lengths of FPGA time.
+            ts_step = self.driver.rx_ts_step
+            if ts_step and step_first_ts is not None and step_last_ts is not None:
+                span = step_last_ts - step_first_ts + ts_step
+                expected = (settle_count + num_buffers) * ts_step
+                if span != expected or i < 3 or i % 10 == 0 or i == num_steps - 1:
+                    verdict = "ok" if span == expected else "BUFFERS_SKIPPED"
+                    print(f"[sfcw] step {i:3d} {f/1e9:.3f}GHz ts: first={step_first_ts} "
+                          f"last={step_last_ts} span={span}/{expected} {verdict}",
+                          flush=True)
 
             if sig_bufs:
                 sig_arr = np.asarray(sig_bufs, dtype=np.float64)

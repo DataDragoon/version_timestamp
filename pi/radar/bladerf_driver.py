@@ -1,5 +1,6 @@
 """bladeRF hardware abstraction — supports dual TX/RX for SFCW reference channel."""
 
+import os
 import threading
 import time
 import numpy as np
@@ -9,6 +10,21 @@ from bladerf._bladerf import ChannelLayout, Format, ffi, libbladeRF
 SCALE = 2047
 MGC = libbladeRF.BLADERF_GAIN_MGC
 TUNING_MODE_FPGA = libbladeRF.BLADERF_TUNING_MODE_FPGA
+
+# Metadata-mode constants, values from libbladeRF.h (the cffi binding does not
+# export #define macros).
+META_FLAG_TX_BURST_START = 1 << 0
+META_FLAG_TX_NOW = 1 << 2
+META_FLAG_RX_NOW = 1 << 31
+META_STATUS_OVERRUN = 1 << 0
+
+# Escape hatch: SFCW_META=0 runs both dual streams in plain SC16_Q11 (no
+# in-band timestamps; bladerf_get_timestamp still works with the patched
+# FPGA, whose counter runs whenever rx_enable is set). Default: meta on.
+# NOTE: metadata must be enabled on BOTH directions or neither — libbladeRF
+# rejects mixed formats with BLADERF_ERR_INVAL (the "Invalid operation or
+# parameter" sweep error).
+META_ENABLED = os.environ.get('SFCW_META', '1') != '0'
 
 
 class BladeRFDriver:
@@ -36,6 +52,13 @@ class BladeRFDriver:
         self._lock = threading.Lock()
         self._tx_buffer = None
         self._dual_channel = False
+        # Timestamp decode state (populated by the dual RX loop)
+        self.last_rx_timestamp = None
+        self.rx_first_timestamp = None
+        self.rx_buffer_count = 0
+        self.rx_ts_step = None
+        self.rx_gap_events = 0
+        self.rx_lost_samples = 0
 
     def open(self):
         self.device = bladerf.BladeRF()
@@ -356,7 +379,7 @@ class BladeRFDriver:
         self._rebuild_tx_dual_buffer()
         self.device.sync_config(
             layout=ChannelLayout.TX_X2,
-            fmt=Format.SC16_Q11,
+            fmt=Format.SC16_Q11_META if META_ENABLED else Format.SC16_Q11,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -369,13 +392,30 @@ class BladeRFDriver:
 
     def _tx_loop_dual(self):
         """TX loop for dual channel — replays the interleaved buffer, re-read each
-        iteration (like _tx_loop) so live waveform/rate changes take effect."""
+        iteration (like _tx_loop) so live waveform/rate changes take effect.
+
+        Metadata mode: the first call opens one continuous burst (TX_NOW +
+        BURST_START); every later call passes flags=0, appending to the same
+        burst with contiguous timestamps so the CW tone stays seamless."""
+        dev_ptr = self.device.dev[0]
+        tx_meta = None
+        if META_ENABLED:
+            tx_meta = ffi.new('struct bladerf_metadata *')
+            tx_meta.flags = META_FLAG_TX_NOW | META_FLAG_TX_BURST_START
         try:
             while not self._tx_stop.is_set():
                 with self._lock:
                     tx_bytes = self._tx_dual_bytes
                     n_samples = self._tx_dual_n_samples
-                self.device.sync_tx(tx_bytes, n_samples)
+                if tx_meta is not None:
+                    rc = libbladeRF.bladerf_sync_tx(dev_ptr, ffi.from_buffer(tx_bytes),
+                                                    n_samples, tx_meta, 3500)
+                    if rc != 0:
+                        print(f"[bladerf] sync_tx(meta) error: rc={rc}", flush=True)
+                        break
+                    tx_meta.flags = 0  # continue the burst
+                else:
+                    self.device.sync_tx(tx_bytes, n_samples)
         except Exception as e:
             print(f"[bladerf] TX dual error: {e}")
         finally:
@@ -403,9 +443,19 @@ class BladeRFDriver:
         self._rx_stop.clear()
         self.rx_running = True
         self._dual_channel = True
+        # Timestamp decode state (read by the SFCW engine)
+        self.last_rx_timestamp = None
+        self.rx_first_timestamp = None
+        self.rx_buffer_count = 0
+        self.rx_ts_step = None      # learned counter advance per buffer
+        self.rx_gap_events = 0
+        self.rx_lost_samples = 0
+        print(f"[bladerf] RX dual stream: "
+              f"{'SC16_Q11_META (in-band timestamps)' if META_ENABLED else 'SC16_Q11 (plain, SFCW_META=0)'}",
+              flush=True)
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
-            fmt=Format.SC16_Q11_META,
+            fmt=Format.SC16_Q11_META if META_ENABLED else Format.SC16_Q11,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -422,18 +472,54 @@ class BladeRFDriver:
         # num_samples is per-channel, so total buffer is num_samples * 2 channels * 2 (I+Q) * 2 bytes
         buf = bytearray(num_samples * 2 * 2 * 2)
         dev_ptr = self.device.dev[0]
-        meta = ffi.new('struct bladerf_metadata *')
-        meta.flags = 0
-        rx_count = 0
+        meta = ffi.new('struct bladerf_metadata *') if META_ENABLED else None
+        prev_ts = None
         try:
             while not self._rx_stop.is_set():
-                rc = libbladeRF.bladerf_sync_rx(dev_ptr, ffi.from_buffer(buf), num_samples, meta, 3500)
-                if rc != 0:
-                    print(f"[bladerf] sync_rx error: {rc}")
-                    break
-                if rx_count < 3:
-                    print(f"[bladerf] RX meta timestamp: {meta.timestamp} (sample count of buf[0])")
-                    rx_count += 1
+                if meta is None:
+                    # Plain mode: no in-band timestamps to decode
+                    self.device.sync_rx(buf, num_samples)
+                else:
+                    # RX_NOW = stream continuously and report each buffer's
+                    # timestamp (flags=0 would mean "capture at meta.timestamp"
+                    # and fail with BLADERF_ERR_TIME_PAST).
+                    meta.flags = META_FLAG_RX_NOW
+                    rc = libbladeRF.bladerf_sync_rx(dev_ptr, ffi.from_buffer(buf),
+                                                    num_samples, meta, 3500)
+                    if rc != 0:
+                        print(f"[bladerf] sync_rx(meta) error: rc={rc}", flush=True)
+                        break
+
+                    ts = meta.timestamp
+                    self.last_rx_timestamp = ts
+                    self.rx_buffer_count += 1
+
+                    if self.rx_first_timestamp is None:
+                        self.rx_first_timestamp = ts
+                        print(f"[bladerf] FIRST RX timestamp: {ts} "
+                              f"(FPGA sample counter at this buffer's first sample)",
+                              flush=True)
+                    elif prev_ts is not None:
+                        gap = ts - prev_ts
+                        if self.rx_ts_step is None:
+                            # Learn the nominal per-buffer advance from the
+                            # first clean gap instead of assuming layout math.
+                            self.rx_ts_step = gap
+                            print(f"[bladerf] RX timestamp advance per buffer: "
+                                  f"{gap} counter ticks", flush=True)
+                        elif gap != self.rx_ts_step:
+                            self.rx_gap_events += 1
+                            self.rx_lost_samples += max(0, gap - self.rx_ts_step)
+                            # Rate-limit: first 5 gaps, then every 100th
+                            if self.rx_gap_events <= 5 or self.rx_gap_events % 100 == 0:
+                                print(f"[bladerf] RX TIMESTAMP GAP #{self.rx_gap_events}: "
+                                      f"prev={prev_ts} now={ts} gap={gap} "
+                                      f"(expected {self.rx_ts_step})", flush=True)
+                    if meta.status & META_STATUS_OVERRUN:
+                        print(f"[bladerf] RX OVERRUN flagged at timestamp {ts}",
+                              flush=True)
+                    prev_ts = ts
+
                 iq = np.frombuffer(buf, dtype=np.int16).copy()
                 # Deinterleave: [I1, Q1, I2, Q2, I1, Q1, I2, Q2, ...]
                 rx1 = np.empty(num_samples * 2, dtype=np.int16)
@@ -462,6 +548,16 @@ class BladeRFDriver:
             self._rx_thread = None
         self.rx_running = False
         self._dual_channel = False
+        # Decode summary: buffers received vs what the FPGA counter says elapsed
+        if (self.rx_first_timestamp is not None
+                and self.last_rx_timestamp is not None
+                and self.rx_ts_step):
+            span = self.last_rx_timestamp - self.rx_first_timestamp + self.rx_ts_step
+            expected = self.rx_buffer_count * self.rx_ts_step
+            print(f"[bladerf] RX stream totals: buffers={self.rx_buffer_count} "
+                  f"counter_span={span} expected={expected} "
+                  f"gaps={self.rx_gap_events} lost={self.rx_lost_samples} ticks",
+                  flush=True)
 
     def get_status(self):
         return {
