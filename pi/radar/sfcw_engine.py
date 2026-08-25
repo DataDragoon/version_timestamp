@@ -38,6 +38,7 @@ class SFCWEngine:
         self.tx_headroom_db = 0
         # Gain table (loaded from disk)
         self._gain_table = None  # dict: freq_hz, tx_gain, rx_gain, tx2_scale, phase_std_deg
+        self._rx_latest_ts = None  # FPGA timestamp of the newest RX buffer
         self._load_gain_table()
         self.running = False
         self._stop_event = threading.Event()
@@ -682,9 +683,27 @@ class SFCWEngine:
         t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
         self._ref_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t)
         # Start with default scale; will be updated per-step from table
+        self._rx_latest_ts = None
         self.driver.start_tx_dual(tx2_digital_scale=0.05)
         self.driver.start_rx_dual(self._rx_capture, num_samples=n)
         time.sleep(0.05)
+
+        # Timestamp decode check: in-band (stream header) vs control path (Nios)
+        first_ts = self.driver.rx_first_timestamp
+        last_ts = self.driver.last_rx_timestamp
+        if first_ts is not None:
+            rate = self.driver.sample_rate
+            print(f"[sfcw] timestamp decode: first={first_ts} latest={last_ts} "
+                  f"elapsed={(last_ts - first_ts)/rate*1000:.1f}ms of FPGA time "
+                  f"({self.driver.rx_buffer_count} buffers x {n} samples/ch)",
+                  flush=True)
+            try:
+                ctrl_ts = self.driver.get_timestamp()
+                print(f"[sfcw] FPGA counter via control path: {ctrl_ts} "
+                      f"(should be slightly ahead of stream's {last_ts})",
+                      flush=True)
+            except Exception as e:
+                print(f"[sfcw] control-path timestamp read failed: {e}", flush=True)
 
         dev_ptr = self.driver.device.dev[0]
         libbladeRF.bladerf_set_gain_mode(dev_ptr, bladerf.CHANNEL_RX(0), libbladeRF.BLADERF_GAIN_MGC)
@@ -699,15 +718,26 @@ class SFCWEngine:
 
     def _rx_capture(self, rx1_iq, rx2_iq):
         self._rx_latest = (rx1_iq, rx2_iq)
+        # FPGA sample-counter timestamp of this buffer's first sample,
+        # decoded by the driver's RX loop just before this callback.
+        self._rx_latest_ts = self.driver.last_rx_timestamp
         self._rx_event.set()
 
     def _measure_step(self, num_buffers):
-        """Capture IQ at current frequency, return (sig_complex, ref_complex, rx1_peak, rx2_peak)."""
+        """Capture IQ at current frequency, return (sig_complex, ref_complex, rx1_peak, rx2_peak).
+
+        Also decodes the FPGA timestamps of the captured buffers and prints a
+        span check: (last - first + buf_samples) must equal captured *
+        buf_samples if the kept buffers were truly consecutive on the FPGA's
+        sample clock; a larger span means buffers streamed past between waits."""
         sig_accum = 0j
         ref_accum = 0j
         rx1_peak = 0.0
         rx2_peak = 0.0
         captured = 0
+        first_ts = None
+        last_ts = None
+        buf_samples = 0
         for _ in range(num_buffers):
             self._rx_event.clear()
             if not self._rx_event.wait(timeout=1.0):
@@ -716,6 +746,10 @@ class SFCWEngine:
             rx1, rx2 = self._rx_latest
             if rx1 is None or rx2 is None:
                 continue
+            if first_ts is None:
+                first_ts = self._rx_latest_ts
+            last_ts = self._rx_latest_ts
+            buf_samples = len(rx1) // 2
 
             i1 = rx1[0::2].astype(np.float64) / 2047.0
             q1 = rx1[1::2].astype(np.float64) / 2047.0
@@ -728,6 +762,14 @@ class SFCWEngine:
             rx2_peak = max(rx2_peak, float(np.max(np.abs(i2))), float(np.max(np.abs(q2))))
 
             captured += 1
+
+        if captured > 0 and first_ts is not None and last_ts is not None and buf_samples > 0:
+            span = last_ts - first_ts + buf_samples
+            expected = captured * buf_samples
+            verdict = "consecutive" if span == expected else "SKIPPED_BUFFERS"
+            print(f"[sfcw] measure: captured={captured}/{num_buffers} "
+                  f"first_ts={first_ts} last_ts={last_ts} "
+                  f"span={span} expected={expected} {verdict}", flush=True)
 
         sig = sig_accum / max(captured, 1)
         ref = ref_accum / max(captured, 1)
