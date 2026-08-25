@@ -457,6 +457,19 @@ class BladeRFDriver:
         print(f"[bladerf] RX dual stream: "
               f"{'SC16_Q11_META (in-band timestamps)' if META_ENABLED else 'SC16_Q11 (plain, SFCW_META=0)'}",
               flush=True)
+        # USB link speed decides the metadata message size: SuperSpeed = 8192-byte
+        # messages, HighSpeed = 2048. A host/FPGA disagreement here misaligns
+        # header parsing (the 1-in-4 sane timestamp symptom).
+        try:
+            speed = libbladeRF.bladerf_device_speed(self.device.dev[0])
+            name, msg = {
+                libbladeRF.BLADERF_DEVICE_SPEED_SUPER: ("SuperSpeed (USB 3.0)", 8192),
+                libbladeRF.BLADERF_DEVICE_SPEED_HIGH: ("HighSpeed (USB 2.0)", 2048),
+            }.get(speed, (f"UNKNOWN ({speed})", 0))
+            print(f"[bladerf] USB link: {name} -> {msg}-byte metadata messages",
+                  flush=True)
+        except Exception as e:
+            print(f"[bladerf] USB speed query failed: {e}", flush=True)
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
             fmt=Format.SC16_Q11_META if META_ENABLED else Format.SC16_Q11,
