@@ -13,15 +13,6 @@ MGC = libbladeRF.BLADERF_GAIN_MGC
 _REG_CAL_CONFIG_2 = 0x16A  # Bit 0: BBDC tracking, Bit 1: RFDC tracking
 _REG_CAL_CONFIG_3 = 0x16B  # Bit 0: RX Quadrature tracking
 
-# Metadata-mode constants, values from libbladeRF.h (the cffi binding does not
-# export #define macros). DIR_RX/DIR_TX are bladerf_direction enum values.
-META_FLAG_TX_BURST_START = 1 << 0
-META_FLAG_TX_NOW = 1 << 2
-META_FLAG_RX_NOW = 1 << 31
-META_STATUS_OVERRUN = 1 << 0
-DIR_RX = 0
-DIR_TX = 1
-
 
 class BladeRFDriver:
     def __init__(self):
@@ -130,15 +121,6 @@ class BladeRFDriver:
         rc = libbladeRF.bladerf_set_rfic_register(dev_ptr, 0, int(addr), int(val) & 0xFF)
         if rc != 0:
             raise RuntimeError(f"RFIC write reg 0x{addr:03X}=0x{val:02X} failed: {rc}")
-
-    def get_timestamp(self, direction=DIR_RX):
-        """Read the FPGA sample counter over the control path (Nios pkt_8x64)."""
-        dev_ptr = self.device.dev[0]
-        ts = ffi.new('uint64_t *')
-        rc = libbladeRF.bladerf_get_timestamp(dev_ptr, direction, ts)
-        if rc != 0:
-            raise RuntimeError(f"bladerf_get_timestamp failed: rc={rc}")
-        return ts[0]
 
     def _configure_channels(self):
         ch_tx = self.device.Channel(bladerf.CHANNEL_TX(0))
@@ -362,7 +344,7 @@ class BladeRFDriver:
         self._dual_channel = True
         self.device.sync_config(
             layout=ChannelLayout.TX_X2,
-            fmt=Format.SC16_Q11_META,
+            fmt=Format.SC16_Q11,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -375,14 +357,7 @@ class BladeRFDriver:
         self._tx_thread.start()
 
     def _tx_loop_dual(self):
-        """TX loop for dual channel — interleaved TX1+TX2 samples.
-
-        Metadata mode: first call opens one continuous burst (TX_NOW +
-        BURST_START); later calls pass flags=0, appending to the same burst
-        with contiguous timestamps so the CW tone stays seamless."""
-        dev_ptr = self.device.dev[0]
-        tx_meta = ffi.new('struct bladerf_metadata *')
-        tx_meta.flags = META_FLAG_TX_NOW | META_FLAG_TX_BURST_START
+        """TX loop for dual channel — interleaved TX1+TX2 samples."""
         try:
             while not self._tx_stop.is_set():
                 with self._lock:
@@ -398,13 +373,7 @@ class BladeRFDriver:
                 else:
                     dual_buf[2::4] = (buf[0::2].astype(np.float64) * scale2).astype(np.int16)
                     dual_buf[3::4] = (buf[1::2].astype(np.float64) * scale2).astype(np.int16)
-                tx_bytes = dual_buf.tobytes()
-                rc = libbladeRF.bladerf_sync_tx(dev_ptr, ffi.from_buffer(tx_bytes),
-                                                n_samples, tx_meta, 3500)
-                if rc != 0:
-                    print(f"[bladerf] sync_tx(meta) error: rc={rc}", flush=True)
-                    break
-                tx_meta.flags = 0  # continue the burst
+                self.device.sync_tx(dual_buf.tobytes(), n_samples)
         except Exception as e:
             print(f"[bladerf] TX dual error: {e}")
         finally:
@@ -434,17 +403,10 @@ class BladeRFDriver:
         self._rx_stop.clear()
         self.rx_running = True
         self._dual_channel = True
-        # Timestamp decode state (read by the SFCW engine)
-        self.last_rx_timestamp = None
-        self.rx_first_timestamp = None
-        self.rx_first_wallclock = None
-        self.rx_buffer_count = 0
-        self.rx_gap_events = 0
-        self.rx_lost_samples = 0
         buf_size = max(4096, num_samples * 2)
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
-            fmt=Format.SC16_Q11_META,
+            fmt=Format.SC16_Q11,
             num_buffers=16,
             buffer_size=buf_size,
             num_transfers=8,
@@ -457,58 +419,15 @@ class BladeRFDriver:
         self._rx_thread.start()
 
     def _rx_loop_dual(self, callback, num_samples):
-        """RX loop for dual channel — deinterleaves RX1 and RX2, decoding the
-        FPGA metadata timestamp of every buffer.
-
-        meta.timestamp is the FPGA sample-counter value of this buffer's first
-        sample (the 64-bit counter the FPGA embeds in each USB message header).
-        The counter ticks once per sample clock and both channels sample on the
-        same tick, so consecutive buffers must differ by exactly rx_count/2 —
-        any bigger gap means the FPGA produced samples the Pi never received."""
+        """RX loop for dual channel — deinterleaves RX1 and RX2."""
         # RX_X2: sync_rx(buf, N) captures N sample-pairs total.
         # Each pair = [I1,Q1,I2,Q2] = 4 int16. Yields N samples per channel.
         # Request num_samples*2 to get num_samples per channel after deinterleave.
         rx_count = num_samples * 2
-        ts_step = rx_count // 2  # expected counter advance per buffer
         buf = bytearray(rx_count * 4 * 2)  # rx_count pairs × 4 int16 × 2 bytes
-        dev_ptr = self.device.dev[0]
-        meta = ffi.new('struct bladerf_metadata *')
-        prev_ts = None
         try:
             while not self._rx_stop.is_set():
-                meta.flags = META_FLAG_RX_NOW
-                rc = libbladeRF.bladerf_sync_rx(dev_ptr, ffi.from_buffer(buf),
-                                                rx_count, meta, 3500)
-                if rc != 0:
-                    print(f"[bladerf] sync_rx(meta) error: rc={rc}", flush=True)
-                    break
-
-                ts = meta.timestamp
-                self.last_rx_timestamp = ts
-                self.rx_buffer_count += 1
-
-                if self.rx_first_timestamp is None:
-                    self.rx_first_timestamp = ts
-                    self.rx_first_wallclock = time.time()
-                    print(f"[bladerf] FIRST RX timestamp: {ts} "
-                          f"(FPGA sample counter at buffer[0]; "
-                          f"{num_samples} samples/ch per buffer, "
-                          f"expect +{ts_step} per buffer)", flush=True)
-                elif prev_ts is not None:
-                    gap = ts - prev_ts
-                    if gap != ts_step:
-                        self.rx_gap_events += 1
-                        self.rx_lost_samples += max(0, gap - ts_step)
-                        # Rate-limit: first 5 gaps, then every 100th
-                        if self.rx_gap_events <= 5 or self.rx_gap_events % 100 == 0:
-                            print(f"[bladerf] RX TIMESTAMP GAP #{self.rx_gap_events}: "
-                                  f"prev={prev_ts} now={ts} gap={gap} "
-                                  f"(expected {ts_step}, "
-                                  f"lost {gap - ts_step} samples/ch)", flush=True)
-                if meta.status & META_STATUS_OVERRUN:
-                    print(f"[bladerf] RX OVERRUN flagged at timestamp {ts}", flush=True)
-                prev_ts = ts
-
+                self.device.sync_rx(buf, rx_count)
                 iq = np.frombuffer(buf, dtype=np.int16).copy()
                 # iq has rx_count*4 int16 values: [I1,Q1,I2,Q2, I1,Q1,I2,Q2, ...]
                 # Each channel has rx_count values, but we want num_samples per ch
@@ -529,7 +448,7 @@ class BladeRFDriver:
                 pass
             self.rx_running = False
 
-    def stop_rx_dual(self, num_samples_per_buffer=1024):
+    def stop_rx_dual(self):
         if not self.rx_running:
             return
         self._rx_stop.set()
@@ -538,17 +457,6 @@ class BladeRFDriver:
             self._rx_thread = None
         self.rx_running = False
         self._dual_channel = False
-        # Decode summary: samples received vs FPGA counter span
-        if self.rx_first_timestamp is not None and self.last_rx_timestamp is not None:
-            received = self.rx_buffer_count * num_samples_per_buffer
-            span = (self.last_rx_timestamp - self.rx_first_timestamp
-                    + num_samples_per_buffer)
-            rate = self.sample_rate or 1
-            print(f"[bladerf] RX stream totals: buffers={self.rx_buffer_count} "
-                  f"samples_received={received}/ch counter_span={span} "
-                  f"({span/rate:.3f}s of FPGA time) "
-                  f"gaps={self.rx_gap_events} lost={self.rx_lost_samples} samples/ch",
-                  flush=True)
 
     def get_status(self):
         return {
