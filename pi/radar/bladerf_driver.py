@@ -59,6 +59,8 @@ class BladeRFDriver:
         self.rx_ts_step = None
         self.rx_gap_events = 0
         self.rx_lost_samples = 0
+        self.rx_corrupt_headers = 0
+        self.rx_overrun_events = 0
 
     def open(self):
         self.device = bladerf.BladeRF()
@@ -450,6 +452,8 @@ class BladeRFDriver:
         self.rx_ts_step = None      # learned counter advance per buffer
         self.rx_gap_events = 0
         self.rx_lost_samples = 0
+        self.rx_corrupt_headers = 0
+        self.rx_overrun_events = 0
         print(f"[bladerf] RX dual stream: "
               f"{'SC16_Q11_META (in-band timestamps)' if META_ENABLED else 'SC16_Q11 (plain, SFCW_META=0)'}",
               flush=True)
@@ -491,34 +495,49 @@ class BladeRFDriver:
                         break
 
                     ts = meta.timestamp
-                    self.last_rx_timestamp = ts
                     self.rx_buffer_count += 1
 
-                    if self.rx_first_timestamp is None:
-                        self.rx_first_timestamp = ts
-                        print(f"[bladerf] FIRST RX timestamp: {ts} "
-                              f"(FPGA sample counter at this buffer's first sample)",
-                              flush=True)
-                    elif prev_ts is not None:
-                        gap = ts - prev_ts
-                        if self.rx_ts_step is None:
-                            # Learn the nominal per-buffer advance from the
-                            # first clean gap instead of assuming layout math.
-                            self.rx_ts_step = gap
-                            print(f"[bladerf] RX timestamp advance per buffer: "
-                                  f"{gap} counter ticks", flush=True)
-                        elif gap != self.rx_ts_step:
-                            self.rx_gap_events += 1
-                            self.rx_lost_samples += max(0, gap - self.rx_ts_step)
-                            # Rate-limit: first 5 gaps, then every 100th
-                            if self.rx_gap_events <= 5 or self.rx_gap_events % 100 == 0:
-                                print(f"[bladerf] RX TIMESTAMP GAP #{self.rx_gap_events}: "
-                                      f"prev={prev_ts} now={ts} gap={gap} "
-                                      f"(expected {self.rx_ts_step})", flush=True)
+                    # A header misparse (message-size mismatch, corrupt meta
+                    # path) shows up as absurd 64-bit values. Classify those
+                    # separately so they don't poison the gap statistics.
+                    corrupt = ts > (1 << 48)  # > ~2.8e14: >8.9 years of samples
+                    if corrupt:
+                        self.rx_corrupt_headers += 1
+                        if self.rx_corrupt_headers <= 3 or self.rx_corrupt_headers % 1000 == 0:
+                            print(f"[bladerf] CORRUPT header #{self.rx_corrupt_headers}: "
+                                  f"ts={ts} (sample data misread as header?)",
+                                  flush=True)
+                    else:
+                        self.last_rx_timestamp = ts
+                        if self.rx_first_timestamp is None:
+                            self.rx_first_timestamp = ts
+                            print(f"[bladerf] FIRST RX timestamp: {ts} "
+                                  f"(FPGA sample counter at this buffer's first sample)",
+                                  flush=True)
+                        elif prev_ts is not None:
+                            gap = ts - prev_ts
+                            if self.rx_ts_step is None and gap > 0:
+                                # Learn the nominal per-buffer advance from the
+                                # first clean gap instead of assuming layout math.
+                                self.rx_ts_step = gap
+                                print(f"[bladerf] RX timestamp advance per buffer: "
+                                      f"{gap} counter ticks", flush=True)
+                            elif self.rx_ts_step and gap != self.rx_ts_step:
+                                self.rx_gap_events += 1
+                                self.rx_lost_samples += max(0, gap - self.rx_ts_step)
+                                # Rate-limit: first 5 gaps, then every 1000th
+                                if self.rx_gap_events <= 5 or self.rx_gap_events % 1000 == 0:
+                                    print(f"[bladerf] RX TIMESTAMP GAP #{self.rx_gap_events}: "
+                                          f"prev={prev_ts} now={ts} gap={gap} "
+                                          f"(expected {self.rx_ts_step})", flush=True)
+                        prev_ts = ts
+
                     if meta.status & META_STATUS_OVERRUN:
-                        print(f"[bladerf] RX OVERRUN flagged at timestamp {ts}",
-                              flush=True)
-                    prev_ts = ts
+                        self.rx_overrun_events += 1
+                        # Rate-limit: first 5, then every 1000th
+                        if self.rx_overrun_events <= 5 or self.rx_overrun_events % 1000 == 0:
+                            print(f"[bladerf] RX OVERRUN #{self.rx_overrun_events} "
+                                  f"at timestamp {ts}", flush=True)
 
                 iq = np.frombuffer(buf, dtype=np.int16).copy()
                 # Deinterleave: [I1, Q1, I2, Q2, I1, Q1, I2, Q2, ...]
@@ -556,7 +575,9 @@ class BladeRFDriver:
             expected = self.rx_buffer_count * self.rx_ts_step
             print(f"[bladerf] RX stream totals: buffers={self.rx_buffer_count} "
                   f"counter_span={span} expected={expected} "
-                  f"gaps={self.rx_gap_events} lost={self.rx_lost_samples} ticks",
+                  f"gaps={self.rx_gap_events} lost={self.rx_lost_samples} ticks "
+                  f"corrupt_headers={self.rx_corrupt_headers} "
+                  f"overruns={self.rx_overrun_events}",
                   flush=True)
 
     def get_status(self):
