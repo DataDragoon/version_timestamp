@@ -1,5 +1,6 @@
 """bladeRF hardware abstraction — supports dual TX/RX for SFCW reference channel."""
 
+import os
 import time
 import threading
 import numpy as np
@@ -21,6 +22,11 @@ META_FLAG_RX_NOW = 1 << 31
 META_STATUS_OVERRUN = 1 << 0
 DIR_RX = 0
 DIR_TX = 1
+
+# Escape hatch: SFCW_META=0 runs both dual streams in plain SC16_Q11 (no
+# in-band timestamps; bladerf_get_timestamp still works with the patched
+# FPGA, whose counter runs whenever rx_enable is set). Default: meta on.
+META_ENABLED = os.environ.get('SFCW_META', '1') != '0'
 
 
 class BladeRFDriver:
@@ -362,7 +368,7 @@ class BladeRFDriver:
         self._dual_channel = True
         self.device.sync_config(
             layout=ChannelLayout.TX_X2,
-            fmt=Format.SC16_Q11_META,
+            fmt=Format.SC16_Q11_META if META_ENABLED else Format.SC16_Q11,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -381,8 +387,10 @@ class BladeRFDriver:
         BURST_START); later calls pass flags=0, appending to the same burst
         with contiguous timestamps so the CW tone stays seamless."""
         dev_ptr = self.device.dev[0]
-        tx_meta = ffi.new('struct bladerf_metadata *')
-        tx_meta.flags = META_FLAG_TX_NOW | META_FLAG_TX_BURST_START
+        tx_meta = None
+        if META_ENABLED:
+            tx_meta = ffi.new('struct bladerf_metadata *')
+            tx_meta.flags = META_FLAG_TX_NOW | META_FLAG_TX_BURST_START
         try:
             while not self._tx_stop.is_set():
                 with self._lock:
@@ -399,12 +407,15 @@ class BladeRFDriver:
                     dual_buf[2::4] = (buf[0::2].astype(np.float64) * scale2).astype(np.int16)
                     dual_buf[3::4] = (buf[1::2].astype(np.float64) * scale2).astype(np.int16)
                 tx_bytes = dual_buf.tobytes()
-                rc = libbladeRF.bladerf_sync_tx(dev_ptr, ffi.from_buffer(tx_bytes),
-                                                n_samples, tx_meta, 3500)
-                if rc != 0:
-                    print(f"[bladerf] sync_tx(meta) error: rc={rc}", flush=True)
-                    break
-                tx_meta.flags = 0  # continue the burst
+                if tx_meta is not None:
+                    rc = libbladeRF.bladerf_sync_tx(dev_ptr, ffi.from_buffer(tx_bytes),
+                                                    n_samples, tx_meta, 3500)
+                    if rc != 0:
+                        print(f"[bladerf] sync_tx(meta) error: rc={rc}", flush=True)
+                        break
+                    tx_meta.flags = 0  # continue the burst
+                else:
+                    self.device.sync_tx(tx_bytes, n_samples)
         except Exception as e:
             print(f"[bladerf] TX dual error: {e}")
         finally:
@@ -442,9 +453,12 @@ class BladeRFDriver:
         self.rx_gap_events = 0
         self.rx_lost_samples = 0
         buf_size = max(4096, num_samples * 2)
+        print(f"[bladerf] RX dual stream: "
+              f"{'SC16_Q11_META (in-band timestamps)' if META_ENABLED else 'SC16_Q11 (plain, SFCW_META=0)'}",
+              flush=True)
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
-            fmt=Format.SC16_Q11_META,
+            fmt=Format.SC16_Q11_META if META_ENABLED else Format.SC16_Q11,
             num_buffers=16,
             buffer_size=buf_size,
             num_transfers=8,
@@ -455,6 +469,18 @@ class BladeRFDriver:
         self.device.enable_module(bladerf.CHANNEL_RX(1), True)
         self._rx_thread = threading.Thread(target=self._rx_loop_dual, args=(callback, num_samples), daemon=True)
         self._rx_thread.start()
+
+    @staticmethod
+    def _deinterleave_and_callback(iq, num_samples, callback):
+        # iq has rx_count*4 int16 values: [I1,Q1,I2,Q2, I1,Q1,I2,Q2, ...]
+        # Each channel has rx_count values, but we want num_samples per ch
+        rx1 = np.empty(num_samples * 2, dtype=np.int16)
+        rx2 = np.empty(num_samples * 2, dtype=np.int16)
+        rx1[0::2] = iq[0::4][:num_samples]
+        rx1[1::2] = iq[1::4][:num_samples]
+        rx2[0::2] = iq[2::4][:num_samples]
+        rx2[1::2] = iq[3::4][:num_samples]
+        callback(rx1, rx2)
 
     def _rx_loop_dual(self, callback, num_samples):
         """RX loop for dual channel — deinterleaves RX1 and RX2, decoding the
@@ -472,10 +498,17 @@ class BladeRFDriver:
         ts_step = rx_count // 2  # expected counter advance per buffer
         buf = bytearray(rx_count * 4 * 2)  # rx_count pairs × 4 int16 × 2 bytes
         dev_ptr = self.device.dev[0]
-        meta = ffi.new('struct bladerf_metadata *')
+        meta = ffi.new('struct bladerf_metadata *') if META_ENABLED else None
         prev_ts = None
         try:
             while not self._rx_stop.is_set():
+                if meta is None:
+                    # Plain mode: no in-band timestamps to decode
+                    self.device.sync_rx(buf, rx_count)
+                    iq = np.frombuffer(buf, dtype=np.int16).copy()
+                    self._deinterleave_and_callback(iq, num_samples, callback)
+                    continue
+
                 meta.flags = META_FLAG_RX_NOW
                 rc = libbladeRF.bladerf_sync_rx(dev_ptr, ffi.from_buffer(buf),
                                                 rx_count, meta, 3500)
@@ -510,15 +543,7 @@ class BladeRFDriver:
                 prev_ts = ts
 
                 iq = np.frombuffer(buf, dtype=np.int16).copy()
-                # iq has rx_count*4 int16 values: [I1,Q1,I2,Q2, I1,Q1,I2,Q2, ...]
-                # Each channel has rx_count values, but we want num_samples per ch
-                rx1 = np.empty(num_samples * 2, dtype=np.int16)
-                rx2 = np.empty(num_samples * 2, dtype=np.int16)
-                rx1[0::2] = iq[0::4][:num_samples]
-                rx1[1::2] = iq[1::4][:num_samples]
-                rx2[0::2] = iq[2::4][:num_samples]
-                rx2[1::2] = iq[3::4][:num_samples]
-                callback(rx1, rx2)
+                self._deinterleave_and_callback(iq, num_samples, callback)
         except Exception as e:
             print(f"[bladerf] RX dual error: {e}")
         finally:
