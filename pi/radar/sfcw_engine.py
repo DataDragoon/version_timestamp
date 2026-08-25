@@ -453,11 +453,6 @@ class SFCWEngine:
         self.driver._configure_channels_dual()
         self.driver.set_tuning_mode_fpga()
         self._fpga_tuning = True
-        try:
-            ts = self.driver.get_timestamp(bladerf.CHANNEL_RX(0))
-            print(f"[bladerf] RX timestamp: {ts} (FPGA counter active)")
-        except Exception as e:
-            print(f"[bladerf] WARNING: timestamp read failed: {e}")
 
     def _start_tx_rx(self):
         self._rx_cond = threading.Condition()
@@ -470,6 +465,11 @@ class SFCWEngine:
         self.driver.start_tx_dual()
         self.driver.start_rx_dual(self._rx_capture, num_samples=n)
         time.sleep(0.05)
+        try:
+            ts = self.driver.get_timestamp(bladerf.CHANNEL_RX(0))
+            print(f"[bladerf] RX timestamp: {ts} (FPGA counter {'active' if ts else 'NOT running - custom RBF not loaded?'})")
+        except Exception as e:
+            print(f"[bladerf] WARNING: timestamp read failed: {e}")
 
         # enable_module() resets gain state, so re-push after modules are enabled.
         # driver.tx_gain/rx_gain/tx2_gain/rx2_gain were already synced from
