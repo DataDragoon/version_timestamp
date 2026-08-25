@@ -405,7 +405,7 @@ class BladeRFDriver:
         self._dual_channel = True
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
-            fmt=Format.SC16_Q11,
+            fmt=Format.SC16_Q11_META,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -421,9 +421,19 @@ class BladeRFDriver:
         # RX_X2: interleaved [RX1_I, RX1_Q, RX2_I, RX2_Q, ...]
         # num_samples is per-channel, so total buffer is num_samples * 2 channels * 2 (I+Q) * 2 bytes
         buf = bytearray(num_samples * 2 * 2 * 2)
+        dev_ptr = self.device.dev[0]
+        meta = ffi.new('struct bladerf_metadata *')
+        meta.flags = 0
+        rx_count = 0
         try:
             while not self._rx_stop.is_set():
-                self.device.sync_rx(buf, num_samples)
+                rc = libbladeRF.bladerf_sync_rx(dev_ptr, ffi.from_buffer(buf), num_samples, meta, 3500)
+                if rc != 0:
+                    print(f"[bladerf] sync_rx error: {rc}")
+                    break
+                if rx_count < 3:
+                    print(f"[bladerf] RX meta timestamp: {meta.timestamp} (sample count of buf[0])")
+                    rx_count += 1
                 iq = np.frombuffer(buf, dtype=np.int16).copy()
                 # Deinterleave: [I1, Q1, I2, Q2, I1, Q1, I2, Q2, ...]
                 rx1 = np.empty(num_samples * 2, dtype=np.int16)
